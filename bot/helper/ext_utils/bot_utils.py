@@ -1,269 +1,247 @@
-from re import findall as re_findall
-from threading import Thread, Event
-from time import time
-from math import ceil
-from html import escape
-from psutil import virtual_memory, cpu_percent, disk_usage
-from requests import head as rhead
-from urllib.request import urlopen
+from httpx import AsyncClient
+from asyncio.subprocess import PIPE
+from functools import partial, wraps
+from concurrent.futures import ThreadPoolExecutor
+from asyncio import (
+    create_subprocess_exec,
+    create_subprocess_shell,
+    run_coroutine_threadsafe,
+    sleep,
+)
 
-from bot import download_dict, download_dict_lock, STATUS_LIMIT, botStartTime, DOWNLOAD_DIR, WEB_PINCODE, BASE_URL
-from bot.helper.telegram_helper.bot_commands import BotCommands
-from bot.helper.telegram_helper.button_build import ButtonMaker
+from ... import user_data, bot_loop
+from ...core.config_manager import Config
+from ..telegram_helper.button_build import ButtonMaker
+from .telegraph_helper import telegraph
+from .help_messages import (
+    YT_HELP_DICT,
+    MIRROR_HELP_DICT,
+    CLONE_HELP_DICT,
+)
 
-MAGNET_REGEX = r"magnet:\?xt=urn:btih:[a-zA-Z0-9]*"
+COMMAND_USAGE = {}
 
-URL_REGEX = r"(?:(?:https?|ftp):\/\/)?[\w/\-?=%.]+\.[\w/\-?=%.]+"
-
-COUNT = 0
-PAGE_NO = 1
-
-
-class MirrorStatus:
-    STATUS_UPLOADING = "Upload"
-    STATUS_DOWNLOADING = "Download"
-    STATUS_CLONING = "Clone"
-    STATUS_WAITING = "Queue"
-    STATUS_PAUSED = "Pause"
-    STATUS_ARCHIVING = "Archive"
-    STATUS_EXTRACTING = "Extract"
-    STATUS_SPLITTING = "Split"
-    STATUS_CHECKING = "CheckUp"
-    STATUS_SEEDING = "Seed"
-
-SIZE_UNITS = ['B', 'KB', 'MB', 'GB', 'TB', 'PB']
+THREAD_POOL = ThreadPoolExecutor(max_workers=500)
 
 
-class setInterval:
-    def __init__(self, interval, action):
+class SetInterval:
+    def __init__(self, interval, action, *args, **kwargs):
         self.interval = interval
         self.action = action
-        self.stopEvent = Event()
-        thread = Thread(target=self.__setInterval)
-        thread.start()
+        self.task = bot_loop.create_task(self._set_interval(*args, **kwargs))
 
-    def __setInterval(self):
-        nextTime = time() + self.interval
-        while not self.stopEvent.wait(nextTime - time()):
-            nextTime += self.interval
-            self.action()
+    async def _set_interval(self, *args, **kwargs):
+        while True:
+            await sleep(self.interval)
+            await self.action(*args, **kwargs)
 
     def cancel(self):
-        self.stopEvent.set()
+        self.task.cancel()
 
-def get_readable_file_size(size_in_bytes) -> str:
-    if size_in_bytes is None:
-        return '0B'
-    index = 0
-    while size_in_bytes >= 1024:
-        size_in_bytes /= 1024
-        index += 1
-    try:
-        return f'{round(size_in_bytes, 2)}{SIZE_UNITS[index]}'
-    except IndexError:
-        return 'File too large'
 
-def getDownloadByGid(gid):
-    with download_dict_lock:
-        for dl in list(download_dict.values()):
-            if dl.gid() == gid:
-                return dl
-    return None
-
-def getAllDownload(req_status: str):
-    with download_dict_lock:
-        for dl in list(download_dict.values()):
-            status = dl.status()
-            if req_status in ['all', status]:
-                return dl
-    return None
-
-def bt_selection_buttons(id_: str):
-    if len(id_) > 20:
-        gid = id_[:12]
-    else:
-        gid = id_
-
-    pincode = ""
-    for n in id_:
-        if n.isdigit():
-            pincode += str(n)
-        if len(pincode) == 4:
-            break
-
+def _build_command_usage(help_dict, command_key):
     buttons = ButtonMaker()
-    if WEB_PINCODE:
-        buttons.buildbutton("Select Files", f"{BASE_URL}/app/files/{id_}")
-        buttons.sbutton("Pincode", f"btsel pin {gid} {pincode}")
+    for name in list(help_dict.keys())[1:]:
+        buttons.data_button(name, f"help {command_key} {name}")
+    buttons.data_button("Close", "help close")
+    COMMAND_USAGE[command_key] = [help_dict["main"], buttons.build_menu(3)]
+    buttons.reset()
+
+
+def create_help_buttons():
+    _build_command_usage(MIRROR_HELP_DICT, "mirror")
+    _build_command_usage(YT_HELP_DICT, "yt")
+    _build_command_usage(CLONE_HELP_DICT, "clone")
+
+
+def bt_selection_buttons(id_):
+    gid = id_[:12] if len(id_) > 25 else id_
+    pin = "".join([n for n in id_ if n.isdigit()][:4])
+    buttons = ButtonMaker()
+    if Config.WEB_PINCODE:
+        buttons.url_button("Select Files", f"{Config.BASE_URL}/app/files?gid={id_}")
+        buttons.data_button("Pincode", f"sel pin {gid} {pin}")
     else:
-        buttons.buildbutton("Select Files", f"{BASE_URL}/app/files/{id_}?pin_code={pincode}")
-    buttons.sbutton("Done Selecting", f"btsel done {gid} {id_}")
+        buttons.url_button(
+            "Select Files", f"{Config.BASE_URL}/app/files?gid={id_}&pin={pin}"
+        )
+    buttons.data_button("Done Selecting", f"sel done {gid} {id_}")
+    buttons.data_button("Cancel", f"sel cancel {gid}")
     return buttons.build_menu(2)
 
-def get_progress_bar_string(status):
-    completed = status.processed_bytes() / 8
-    total = status.size_raw() / 8
-    p = 0 if total == 0 else round(completed * 100 / total)
-    p = min(max(p, 0), 100)
-    cFull = p // 8
-    p_str = '■' * cFull
-    p_str += '□' * (12 - cFull)
-    p_str = f"[{p_str}]"
-    return p_str
 
-def get_readable_message():
-    with download_dict_lock:
-        msg = ""
-        if STATUS_LIMIT is not None:
-            tasks = len(download_dict)
-            global pages
-            pages = ceil(tasks/STATUS_LIMIT)
-            if PAGE_NO > pages and pages != 0:
-                globals()['COUNT'] -= STATUS_LIMIT
-                globals()['PAGE_NO'] -= 1
-        for index, download in enumerate(list(download_dict.values())[COUNT:], start=1):
-            msg += f"<b><a href='{download.message.link}'>{download.status()}</a>: </b>"
-            msg += f"<code>{escape(str(download.name()))}</code>"
-            if download.status() not in [MirrorStatus.STATUS_SPLITTING, MirrorStatus.STATUS_SEEDING]:
-                msg += f"\n{get_progress_bar_string(download)} {download.progress()}"
-                msg += f"\n<b>Processed:</b> {get_readable_file_size(download.processed_bytes())} of {download.size()}"
-                msg += f"\n<b>Speed:</b> {download.speed()} | <b>ETA:</b> {download.eta()}"
-                if hasattr(download, 'seeders_num'):
-                    try:
-                        msg += f"\n<b>Seeders:</b> {download.seeders_num()} | <b>Leechers:</b> {download.leechers_num()}"
-                    except:
-                        pass
-            elif download.status() == MirrorStatus.STATUS_SEEDING:
-                msg += f"\n<b>Size: </b>{download.size()}"
-                msg += f"\n<b>Speed: </b>{download.upload_speed()}"
-                msg += f" | <b>Uploaded: </b>{download.uploaded_bytes()}"
-                msg += f"\n<b>Ratio: </b>{download.ratio()}"
-                msg += f" | <b>Time: </b>{download.seeding_time()}"
+async def get_telegraph_list(telegraph_content):
+    path = [
+        (
+            await telegraph.create_page(
+                title="Mirror-Leech-Bot Drive Search", content=content
+            )
+        )["path"]
+        for content in telegraph_content
+    ]
+    if len(path) > 1:
+        await telegraph.edit_telegraph(path, telegraph_content)
+    buttons = ButtonMaker()
+    buttons.url_button("🔎 VIEW", f"https://telegra.ph/{path[0]}")
+    return buttons.build_menu(1)
+
+
+def arg_parser(items, arg_base):
+
+    if not items:
+        return
+
+    arg_start = -1
+    i = 0
+    total = len(items)
+
+    bool_arg_set = {
+        "-b",
+        "-e",
+        "-z",
+        "-s",
+        "-j",
+        "-d",
+        "-sv",
+        "-ss",
+        "-f",
+        "-fd",
+        "-fu",
+        "-sync",
+        "-hl",
+        "-doc",
+        "-med",
+        "-ut",
+        "-bt",
+    }
+
+    while i < total:
+        part = items[i]
+
+        if part in arg_base:
+            if arg_start == -1:
+                arg_start = i
+
+            if (
+                i + 1 == total
+                and part in bool_arg_set
+                or part
+                in [
+                    "-s",
+                    "-j",
+                    "-f",
+                    "-fd",
+                    "-fu",
+                    "-sync",
+                    "-hl",
+                    "-doc",
+                    "-med",
+                    "-ut",
+                    "-bt",
+                ]
+            ):
+                arg_base[part] = True
             else:
-                msg += f"\n<b>Size: </b>{download.size()}"
-            msg += f"\n<code>/{BotCommands.CancelMirror} {download.gid()}</code>"
-            msg += "\n\n"
-            if STATUS_LIMIT is not None and index == STATUS_LIMIT:
-                break
-        if len(msg) == 0:
-            return None, None
-        dl_speed = 0
-        up_speed = 0
-        for download in list(download_dict.values()):
-            if download.status() == MirrorStatus.STATUS_DOWNLOADING:
-                spd = download.speed()
-                if 'K' in spd:
-                    dl_speed += float(spd.split('K')[0]) * 1024
-                elif 'M' in spd:
-                    dl_speed += float(spd.split('M')[0]) * 1048576
-            elif download.status() == MirrorStatus.STATUS_UPLOADING:
-                spd = download.speed()
-                if 'KB/s' in spd:
-                    up_speed += float(spd.split('K')[0]) * 1024
-                elif 'MB/s' in spd:
-                    up_speed += float(spd.split('M')[0]) * 1048576
-            elif download.status() == MirrorStatus.STATUS_SEEDING:
-                spd = download.upload_speed()
-                if 'K' in spd:
-                    up_speed += float(spd.split('K')[0]) * 1024
-                elif 'M' in spd:
-                    up_speed += float(spd.split('M')[0]) * 1048576
-        bmsg = f"<b>CPU:</b> {cpu_percent()}% | <b>FREE:</b> {get_readable_file_size(disk_usage(DOWNLOAD_DIR).free)}"
-        bmsg += f"\n<b>RAM:</b> {virtual_memory().percent}% | <b>UPTIME:</b> {get_readable_time(time() - botStartTime)}"
-        bmsg += f"\n<b>DL:</b> {get_readable_file_size(dl_speed)}/s | <b>UL:</b> {get_readable_file_size(up_speed)}/s"
-        if STATUS_LIMIT is not None and tasks > STATUS_LIMIT:
-            msg += f"<b>Page:</b> {PAGE_NO}/{pages} | <b>Tasks:</b> {tasks}\n"
-            buttons = ButtonMaker()
-            buttons.sbutton("Previous", "status pre")
-            buttons.sbutton("Next", "status nex")
-            button = buttons.build_menu(2)
-            return msg + bmsg, button
-        return msg + bmsg, ""
+                sub_list = []
+                for j in range(i + 1, total):
+                    if items[j] in arg_base:
+                        if part in bool_arg_set and not sub_list:
+                            arg_base[part] = True
+                            break
+                        if not sub_list:
+                            break
+                        check = " ".join(sub_list).strip()
+                        if check.startswith("[") and check.endswith("]"):
+                            break
+                        elif not check.startswith("["):
+                            break
+                    sub_list.append(items[j])
+                if sub_list:
+                    value = " ".join(sub_list)
+                    if part == "-ff" and not value.strip().startswith("["):
+                        arg_base[part].add(value)
+                    else:
+                        arg_base[part] = value
+                    i += len(sub_list)
 
-def turn(data):
+        i += 1
+
+    if "link" in arg_base:
+        link_items = items[:arg_start] if arg_start != -1 else items
+        if link_items:
+            arg_base["link"] = " ".join(link_items)
+
+
+def get_size_bytes(size):
+    size = size.lower()
+    if "k" in size:
+        size = int(float(size.split("k")[0]) * 1024)
+    elif "m" in size:
+        size = int(float(size.split("m")[0]) * 1048576)
+    elif "g" in size:
+        size = int(float(size.split("g")[0]) * 1073741824)
+    elif "t" in size:
+        size = int(float(size.split("t")[0]) * 1099511627776)
+    else:
+        size = 0
+    return size
+
+
+async def get_content_type(url):
     try:
-        with download_dict_lock:
-            global COUNT, PAGE_NO
-            if data[1] == "nex":
-                if PAGE_NO == pages:
-                    COUNT = 0
-                    PAGE_NO = 1
-                else:
-                    COUNT += STATUS_LIMIT
-                    PAGE_NO += 1
-            elif data[1] == "pre":
-                if PAGE_NO == 1:
-                    COUNT = STATUS_LIMIT * (pages - 1)
-                    PAGE_NO = pages
-                else:
-                    COUNT -= STATUS_LIMIT
-                    PAGE_NO -= 1
-        return True
+        async with AsyncClient() as client:
+            response = await client.get(url, allow_redirects=True, verify=False)
+            return response.headers.get("Content-Type")
     except:
-        return False
+        return None
 
-def get_readable_time(seconds: int) -> str:
-    result = ''
-    (days, remainder) = divmod(seconds, 86400)
-    days = int(days)
-    if days != 0:
-        result += f'{days}d'
-    (hours, remainder) = divmod(remainder, 3600)
-    hours = int(hours)
-    if hours != 0:
-        result += f'{hours}h'
-    (minutes, seconds) = divmod(remainder, 60)
-    minutes = int(minutes)
-    if minutes != 0:
-        result += f'{minutes}m'
-    seconds = int(seconds)
-    result += f'{seconds}s'
-    return result
 
-def is_url(url: str):
-    url = re_findall(URL_REGEX, url)
-    return bool(url)
+def update_user_ldata(id_, key, value):
+    user_data.setdefault(id_, {})
+    user_data[id_][key] = value
 
-def is_gdrive_link(url: str):
-    return "drive.google.com" in url
 
-def is_mega_link(url: str):
-    return "mega.nz" in url or "mega.co.nz" in url
+async def cmd_exec(cmd, shell=False):
+    if shell:
+        proc = await create_subprocess_shell(cmd, stdout=PIPE, stderr=PIPE)
+    else:
+        proc = await create_subprocess_exec(*cmd, stdout=PIPE, stderr=PIPE)
+    stdout, stderr = await proc.communicate()
+    try:
+        stdout = stdout.decode().strip()
+    except:
+        stdout = "Unable to decode the response!"
+    try:
+        stderr = stderr.decode().strip()
+    except:
+        stderr = "Unable to decode the error!"
+    return stdout, stderr, proc.returncode
 
-def get_mega_link_type(url: str):
-    if "folder" in url:
-        return "folder"
-    elif "file" in url:
-        return "file"
-    elif "/#F!" in url:
-        return "folder"
-    return "file"
 
-def is_magnet(url: str):
-    magnet = re_findall(MAGNET_REGEX, url)
-    return bool(magnet)
-
-def new_thread(fn):
-    """To use as decorator to make a function call threaded.
-    Needs import
-    from threading import Thread"""
-
-    def wrapper(*args, **kwargs):
-        thread = Thread(target=fn, args=args, kwargs=kwargs)
-        thread.start()
-        return thread
+def new_task(func):
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        task = bot_loop.create_task(func(*args, **kwargs))
+        return task
 
     return wrapper
 
-def get_content_type(link: str) -> str:
-    try:
-        res = rhead(link, allow_redirects=True, timeout=5, headers = {'user-agent': 'Wget/1.12'})
-        content_type = res.headers.get('content-type')
-    except:
-        try:
-            res = urlopen(link, timeout=5)
-            info = res.info()
-            content_type = info.get_content_type()
-        except:
-            content_type = None
-    return content_type
+
+async def sync_to_async(func, *args, wait=True, **kwargs):
+    pfunc = partial(func, *args, **kwargs)
+    future = bot_loop.run_in_executor(THREAD_POOL, pfunc)
+    return await future if wait else future
+
+
+def async_to_sync(func, *args, wait=True, **kwargs):
+    future = run_coroutine_threadsafe(func(*args, **kwargs), bot_loop)
+    return future.result() if wait else future
+
+
+def loop_thread(func):
+    @wraps(func)
+    def wrapper(*args, wait=False, **kwargs):
+        future = run_coroutine_threadsafe(func(*args, **kwargs), bot_loop)
+        return future.result() if wait else future
+
+    return wrapper

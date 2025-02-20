@@ -1,34 +1,59 @@
-from telegram.ext import MessageFilter
-from telegram import Message
-from bot import AUTHORIZED_CHATS, SUDO_USERS, OWNER_ID
+from pyrogram.filters import create
+
+from ... import user_data, auth_chats, sudo_users
+from ...core.config_manager import Config
 
 
 class CustomFilters:
-    class __OwnerFilter(MessageFilter):
-        def filter(self, message: Message):
-            return message.from_user.id == OWNER_ID
+    async def owner_filter(self, _, update):
+        user = update.from_user or update.sender_chat
+        return user.id == Config.OWNER_ID
 
-    owner_filter = __OwnerFilter()
+    owner = create(owner_filter)
 
-    class __AuthorizedUserFilter(MessageFilter):
-        def filter(self, message: Message):
-            uid = message.from_user.id
-            return uid in AUTHORIZED_CHATS or uid in SUDO_USERS or uid == OWNER_ID
+    async def authorized_user(self, _, update):
+        user = update.from_user or update.sender_chat
+        uid = user.id
+        chat_id = update.chat.id
+        thread_id = update.message_thread_id if update.is_topic_message else None
+        return bool(
+            uid == Config.OWNER_ID
+            or (
+                uid in user_data
+                and (
+                    user_data[uid].get("AUTH", False)
+                    or user_data[uid].get("SUDO", False)
+                )
+            )
+            or (
+                chat_id in user_data
+                and user_data[chat_id].get("AUTH", False)
+                and (
+                    thread_id is None
+                    or thread_id in user_data[chat_id].get("thread_ids", [])
+                )
+            )
+            or uid in sudo_users
+            or uid in auth_chats
+            or chat_id in auth_chats
+            and (
+                auth_chats[chat_id]
+                and thread_id
+                and thread_id in auth_chats[chat_id]
+                or not auth_chats[chat_id]
+            )
+        )
 
-    authorized_user = __AuthorizedUserFilter()
+    authorized = create(authorized_user)
 
-    class __AuthorizedChat(MessageFilter):
-        def filter(self, message: Message):
-            return message.chat.id in AUTHORIZED_CHATS
+    async def sudo_user(self, _, update):
+        user = update.from_user or update.sender_chat
+        uid = user.id
+        return bool(
+            uid == Config.OWNER_ID
+            or uid in user_data
+            and user_data[uid].get("SUDO")
+            or uid in sudo_users
+        )
 
-    authorized_chat = __AuthorizedChat()
-
-    class __SudoUser(MessageFilter):
-        def filter(self, message: Message):
-            return message.from_user.id in SUDO_USERS
-
-    sudo_user = __SudoUser()
-
-    @staticmethod
-    def _owner_query(user_id):
-        return user_id == OWNER_ID or user_id in SUDO_USERS
+    sudo = create(sudo_user)
