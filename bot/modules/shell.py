@@ -1,43 +1,30 @@
-from subprocess import Popen, PIPE
-from telegram.ext import CommandHandler
+from io import BytesIO
 
-from bot import LOGGER, dispatcher
-from bot.helper.telegram_helper.filters import CustomFilters
-from bot.helper.telegram_helper.bot_commands import BotCommands
+from .. import LOGGER
+from ..helper.ext_utils.bot_utils import cmd_exec, new_task
+from ..helper.telegram_helper.message_utils import send_message, send_file
 
 
-def shell(update, context):
-    message = update.effective_message
+@new_task
+async def run_shell(_, message):
     cmd = message.text.split(maxsplit=1)
     if len(cmd) == 1:
-        return message.reply_text('No command to execute was given.', parse_mode='HTML')
+        await send_message(message, "No command to execute was given.")
+        return
     cmd = cmd[1]
-    process = Popen(cmd, stdout=PIPE, stderr=PIPE, shell=True)
-    stdout, stderr = process.communicate()
-    reply = ''
-    stderr = stderr.decode()
-    stdout = stdout.decode()
+    stdout, stderr, _ = await cmd_exec(cmd, shell=True)
+    reply = ""
     if len(stdout) != 0:
-        reply += f"*Stdout*\n`{stdout}`\n"
+        reply += f"*Stdout*\n<code>{stdout}</code>\n"
         LOGGER.info(f"Shell - {cmd} - {stdout}")
     if len(stderr) != 0:
-        reply += f"*Stderr*\n`{stderr}`\n"
+        reply += f"*Stderr*\n<code>{stderr}</code>"
         LOGGER.error(f"Shell - {cmd} - {stderr}")
     if len(reply) > 3000:
-        with open('shell_output.txt', 'w') as file:
-            file.write(reply)
-        with open('shell_output.txt', 'rb') as doc:
-            context.bot.send_document(
-                document=doc,
-                filename=doc.name,
-                reply_to_message_id=message.message_id,
-                chat_id=message.chat_id)
+        with BytesIO(str.encode(reply)) as out_file:
+            out_file.name = "shell_output.txt"
+            await send_file(message, out_file)
     elif len(reply) != 0:
-        message.reply_text(reply, parse_mode='Markdown')
+        await send_message(message, reply)
     else:
-        message.reply_text('No Reply', parse_mode='Markdown')
-
-
-SHELL_HANDLER = CommandHandler(BotCommands.ShellCommand, shell,
-                                                  filters=CustomFilters.owner_filter, run_async=True)
-dispatcher.add_handler(SHELL_HANDLER)
+        await send_message(message, "No Reply")

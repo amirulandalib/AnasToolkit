@@ -1,302 +1,407 @@
+from aiofiles.os import path as aiopath
 from base64 import b64encode
-from re import match as re_match, split as re_split
-from os import path as ospath
-from time import sleep, time
-from threading import Thread
-from telegram.ext import CommandHandler
-from requests import get as rget
+from re import match as re_match
 
-from bot import dispatcher, DOWNLOAD_DIR, LOGGER
-from bot.helper.ext_utils.bot_utils import is_url, is_magnet, is_mega_link, is_gdrive_link, get_content_type
-from bot.helper.ext_utils.exceptions import DirectDownloadLinkException
-from bot.helper.mirror_utils.download_utils.aria2_download import add_aria2c_download
-from bot.helper.mirror_utils.download_utils.gd_downloader import add_gd_download
-from bot.helper.mirror_utils.download_utils.qbit_downloader import QbDownloader
-from bot.helper.mirror_utils.download_utils.mega_downloader import add_mega_download
-from bot.helper.mirror_utils.download_utils.direct_link_generator import direct_link_generator
-from bot.helper.mirror_utils.download_utils.telegram_downloader import TelegramDownloadHelper
-from bot.helper.telegram_helper.bot_commands import BotCommands
-from bot.helper.telegram_helper.filters import CustomFilters
-from bot.helper.telegram_helper.message_utils import sendMessage
-from .listener import MirrorLeechListener
+from .. import LOGGER, bot_loop, task_dict_lock, DOWNLOAD_DIR
+from ..helper.ext_utils.bot_utils import (
+    get_content_type,
+    sync_to_async,
+    arg_parser,
+    COMMAND_USAGE,
+)
+from ..helper.ext_utils.exceptions import DirectDownloadLinkException
+from ..helper.ext_utils.links_utils import (
+    is_url,
+    is_magnet,
+    is_gdrive_link,
+    is_rclone_path,
+    is_telegram_link,
+    is_gdrive_id,
+)
+from ..helper.listeners.task_listener import TaskListener
+from ..helper.mirror_leech_utils.download_utils.aria2_download import (
+    add_aria2_download,
+)
+from ..helper.mirror_leech_utils.download_utils.direct_downloader import (
+    add_direct_download,
+)
+from ..helper.mirror_leech_utils.download_utils.direct_link_generator import (
+    direct_link_generator,
+)
+from ..helper.mirror_leech_utils.download_utils.gd_download import add_gd_download
+from ..helper.mirror_leech_utils.download_utils.jd_download import add_jd_download
+from ..helper.mirror_leech_utils.download_utils.qbit_download import add_qb_torrent
+from ..helper.mirror_leech_utils.download_utils.nzb_downloader import add_nzb
+from ..helper.mirror_leech_utils.download_utils.rclone_download import (
+    add_rclone_download,
+)
+from ..helper.mirror_leech_utils.download_utils.telegram_download import (
+    TelegramDownloadHelper,
+)
+from ..helper.telegram_helper.message_utils import send_message, get_tg_link_message
 
 
-def _mirror_leech(bot, message, isZip=False, extract=False, isQbit=False, isLeech=False):
-    mesg = message.text.split('\n')
-    message_args = mesg[0].split(maxsplit=1)
-    name_args = mesg[0].split('|', maxsplit=1)
-    index = 1
-    ratio = None
-    seed_time = None
-    select = False
-    seed = False
-    multi = 0
+class Mirror(TaskListener):
+    def __init__(
+        self,
+        client,
+        message,
+        is_qbit=False,
+        is_leech=False,
+        is_jd=False,
+        is_nzb=False,
+        same_dir=None,
+        bulk=None,
+        multi_tag=None,
+        options="",
+    ):
+        if same_dir is None:
+            same_dir = {}
+        if bulk is None:
+            bulk = []
+        self.message = message
+        self.client = client
+        self.multi_tag = multi_tag
+        self.options = options
+        self.same_dir = same_dir
+        self.bulk = bulk
+        super().__init__()
+        self.is_qbit = is_qbit
+        self.is_leech = is_leech
+        self.is_jd = is_jd
+        self.is_nzb = is_nzb
 
-    if len(message_args) > 1:
-        args = mesg[0].split(maxsplit=3)
-        for x in args:
-            x = x.strip()
-            if x == 's':
-               select = True
-               index += 1
-            elif x == 'd':
-                seed = True
-                index += 1
-            elif x.startswith('d:'):
-                seed = True
-                index += 1
-                dargs = x.split(':')
-                ratio = dargs[1] if dargs[1] else None
-                if len(dargs) == 3:
-                    seed_time = dargs[2] if dargs[2] else None
-            elif x.isdigit():
-                multi = int(x)
-                mi = index
-        if multi == 0:
-            message_args = mesg[0].split(maxsplit=index)
-            if len(message_args) > index:
-                link = message_args[index].strip()
-                if link.startswith(("|", "pswd:")):
-                    link = ''
-            else:
-                link = ''
-        else:
-            link = ''
-    else:
-        link = ''
+    async def new_event(self):
+        text = self.message.text.split("\n")
+        input_list = text[0].split(" ")
 
-    if len(name_args) > 1:
-        name = name_args[1]
-        name = name.split(' pswd:')[0]
-        name = name.strip()
-    else:
-        name = ''
+        args = {
+            "-doc": False,
+            "-med": False,
+            "-d": False,
+            "-j": False,
+            "-s": False,
+            "-b": False,
+            "-e": False,
+            "-z": False,
+            "-sv": False,
+            "-ss": False,
+            "-f": False,
+            "-fd": False,
+            "-fu": False,
+            "-hl": False,
+            "-bt": False,
+            "-ut": False,
+            "-i": 0,
+            "-sp": 0,
+            "link": "",
+            "-n": "",
+            "-m": "",
+            "-up": "",
+            "-rcf": "",
+            "-au": "",
+            "-ap": "",
+            "-h": "",
+            "-t": "",
+            "-ca": "",
+            "-cv": "",
+            "-ns": "",
+            "-tl": "",
+            "-ff": set(),
+        }
 
-    link = re_split(r"pswd:|\|", link)[0]
-    link = link.strip()
+        arg_parser(input_list[1:], args)
 
-    pswd_arg = mesg[0].split(' pswd: ')
-    if len(pswd_arg) > 1:
-        pswd = pswd_arg[1]
-    else:
-        pswd = None
+        self.select = args["-s"]
+        self.seed = args["-d"]
+        self.name = args["-n"]
+        self.up_dest = args["-up"]
+        self.rc_flags = args["-rcf"]
+        self.link = args["link"]
+        self.compress = args["-z"]
+        self.extract = args["-e"]
+        self.join = args["-j"]
+        self.thumb = args["-t"]
+        self.split_size = args["-sp"]
+        self.sample_video = args["-sv"]
+        self.screen_shots = args["-ss"]
+        self.force_run = args["-f"]
+        self.force_download = args["-fd"]
+        self.force_upload = args["-fu"]
+        self.convert_audio = args["-ca"]
+        self.convert_video = args["-cv"]
+        self.name_sub = args["-ns"]
+        self.hybrid_leech = args["-hl"]
+        self.thumbnail_layout = args["-tl"]
+        self.as_doc = args["-doc"]
+        self.as_med = args["-med"]
+        self.folder_name = f"/{args["-m"]}".rstrip("/") if len(args["-m"]) > 0 else ""
+        self.bot_trans = args["-bt"]
+        self.user_trans = args["-ut"]
 
-    if message.from_user.username:
-        tag = f"@{message.from_user.username}"
-    else:
-        tag = message.from_user.mention_html(message.from_user.first_name)
+        headers = args["-h"]
+        is_bulk = args["-b"]
 
-    reply_to = message.reply_to_message
-    if reply_to is not None:
-        file_ = reply_to.document or reply_to.video or reply_to.audio or reply_to.photo or None
-        if not reply_to.from_user.is_bot:
-            if reply_to.from_user.username:
-                tag = f"@{reply_to.from_user.username}"
-            else:
-                tag = reply_to.from_user.mention_html(reply_to.from_user.first_name)
-        if len(link) == 0 or not is_url(link) and not is_magnet(link):
-            if file_ is None:
-                reply_text = reply_to.text.split(maxsplit=1)[0].strip()
-                if is_url(reply_text) or is_magnet(reply_text):
-                    link = reply_to.text.strip()
-            elif isinstance(file_, list):
-                link = file_[-1].get_file().file_path
-            elif not isQbit and file_.mime_type != "application/x-bittorrent":
-                listener = MirrorLeechListener(bot, message, isZip, extract, isQbit, isLeech, pswd, tag)
-                Thread(target=TelegramDownloadHelper(listener).add_download, args=(message, f'{DOWNLOAD_DIR}{listener.uid}/', name)).start()
-                if multi > 1:
-                    sleep(4)
-                    nextmsg = type('nextmsg', (object, ), {'chat_id': message.chat_id, 'message_id': message.reply_to_message.message_id + 1})
-                    msg = message.text.split(maxsplit=mi+1)
-                    msg[mi] = f"{multi - 1}"
-                    nextmsg = sendMessage(" ".join(msg), bot, nextmsg)
-                    nextmsg.from_user.id = message.from_user.id
-                    sleep(4)
-                    Thread(target=_mirror_leech, args=(bot, nextmsg, isZip, extract, isQbit, isLeech)).start()
-                return
-            else:
-                link = file_.get_file().file_path
+        bulk_start = 0
+        bulk_end = 0
+        ratio = None
+        seed_time = None
+        reply_to = None
+        file_ = None
+        session = ""
 
-    if not is_url(link) and not is_magnet(link):
-        help_msg = '''
-<code>/cmd</code> link |newname pswd: xx(zip/unzip)
+        try:
+            self.multi = int(args["-i"])
+        except:
+            self.multi = 0
 
-<b>By replying to link/file:</b>
-<code>/cmd</code> |newname pswd: xx(zip/unzip)
-
-<b>Direct link authorization:</b>
-<code>/cmd</code> link |newname pswd: xx(zip/unzip)
-<b>username</b>
-<b>password</b>
-
-<b>Bittorrent selection:</b>
-<code>/cmd</code> <b>s</b> link or by replying to file/link
-
-<b>Bittorrent seed</b>:
-<code>/cmd</code> <b>d</b> link or by replying to file/link
-To specify ratio and seed time add d:ratio:time. Ex: d:0.7:10 (ratio and time) or d:0.7 (only ratio) or d::10 (only time) where time in minutes.
-
-<b>Multi links only by replying to first link/file:</b>
-<code>/cmd</code> 10(number of links/files)
-Number should be always before |newname or pswd:
-
-<b>NOTES:</b>
-1. When use cmd by reply don't add any perfix in link msg! always add them after cmd msg!
-2. You can't add this perfixes <b>|newname, pswd: and authorization</b> randomly. They should be arranged like exmaple above, rename then pswd then authorization. If you don't want to add pswd for example then it will be (|newname authorization), just don't change the arrangement.
-3. You can add this perfixes <b>d, s and multi</b> randomly. Ex: <code>/cmd</code> d:1:20 s 10 <b>or</b> <code>/cmd</code> s 10 d:0.5:100
-4. Commands that start with <b>qb</b> are ONLY for torrents.
-'''
-        return sendMessage(help_msg, bot, message)
-
-    LOGGER.info(link)
-
-    if not is_mega_link(link) and not isQbit and not is_magnet(link) \
-        and not is_gdrive_link(link) and not link.endswith('.torrent'):
-        content_type = get_content_type(link)
-        if content_type is None or re_match(r'text/html|text/plain', content_type):
-            try:
-                link = direct_link_generator(link)
-                LOGGER.info(f"Generated link: {link}")
-            except DirectDownloadLinkException as e:
-                LOGGER.info(str(e))
-                if str(e).startswith('ERROR:'):
-                    return sendMessage(str(e), bot, message)
-    elif isQbit and not is_magnet(link):
-        if link.endswith('.torrent') or "https://api.telegram.org/file/" in link:
-            content_type = None
-        else:
-            content_type = get_content_type(link)
-        if content_type is None or re_match(r'application/x-bittorrent|application/octet-stream', content_type):
-            try:
-                resp = rget(link, timeout=10, headers = {'user-agent': 'Wget/1.12'})
-                if resp.status_code == 200:
-                    file_name = str(time()).replace(".", "") + ".torrent"
-                    with open(file_name, "wb") as t:
-                        t.write(resp.content)
-                    link = str(file_name)
+        try:
+            if args["-ff"]:
+                if isinstance(args["-ff"], set):
+                    self.ffmpeg_cmds = args["-ff"]
                 else:
-                    return sendMessage(f"{tag} ERROR: link got HTTP response: {resp.status_code}", bot, message)
+                    self.ffmpeg_cmds = eval(args["-ff"])
+        except Exception as e:
+            self.ffmpeg_cmds = None
+            LOGGER.error(e)
+
+        if not isinstance(self.seed, bool):
+            dargs = self.seed.split(":")
+            ratio = dargs[0] or None
+            if len(dargs) == 2:
+                seed_time = dargs[1] or None
+            self.seed = True
+
+        if not isinstance(is_bulk, bool):
+            dargs = is_bulk.split(":")
+            bulk_start = dargs[0] or 0
+            if len(dargs) == 2:
+                bulk_end = dargs[1] or 0
+            is_bulk = True
+
+        if not is_bulk:
+            if self.multi > 0:
+                if self.folder_name:
+                    async with task_dict_lock:
+                        if self.folder_name in self.same_dir:
+                            self.same_dir[self.folder_name]["tasks"].add(self.mid)
+                            for fd_name in self.same_dir:
+                                if fd_name != self.folder_name:
+                                    self.same_dir[fd_name]["total"] -= 1
+                        elif self.same_dir:
+                            self.same_dir[self.folder_name] = {
+                                "total": self.multi,
+                                "tasks": {self.mid},
+                            }
+                            for fd_name in self.same_dir:
+                                if fd_name != self.folder_name:
+                                    self.same_dir[fd_name]["total"] -= 1
+                        else:
+                            self.same_dir = {
+                                self.folder_name: {
+                                    "total": self.multi,
+                                    "tasks": {self.mid},
+                                }
+                            }
+                elif self.same_dir:
+                    async with task_dict_lock:
+                        for fd_name in self.same_dir:
+                            self.same_dir[fd_name]["total"] -= 1
+        else:
+            await self.init_bulk(input_list, bulk_start, bulk_end, Mirror)
+            return
+
+        if len(self.bulk) != 0:
+            del self.bulk[0]
+
+        await self.run_multi(input_list, Mirror)
+
+        await self.get_tag(text)
+
+        path = f"{DOWNLOAD_DIR}{self.mid}{self.folder_name}"
+
+        if not self.link and (reply_to := self.message.reply_to_message):
+            if reply_to.text:
+                self.link = reply_to.text.split("\n", 1)[0].strip()
+        if is_telegram_link(self.link):
+            try:
+                reply_to, session = await get_tg_link_message(self.link)
             except Exception as e:
-                error = str(e).replace('<', ' ').replace('>', ' ')
-                if error.startswith('No connection adapters were found for'):
-                    link = error.split("'")[1]
-                else:
-                    LOGGER.error(str(e))
-                    return sendMessage(tag + " " + error, bot, message)
-        else:
-            msg = "Qb commands for torrents only. if you are trying to dowload torrent then report."
-            return sendMessage(msg, bot, message)
+                await send_message(self.message, f"ERROR: {e}")
+                await self.remove_from_same_dir()
+                return
 
-    listener = MirrorLeechListener(bot, message, isZip, extract, isQbit, isLeech, pswd, tag, select, seed)
-
-    if is_gdrive_link(link):
-        if not isZip and not extract and not isLeech:
-            gmsg = f"Use /{BotCommands.CloneCommand} to clone Google Drive file/folder\n\n"
-            gmsg += f"Use /{BotCommands.ZipMirrorCommand[0]} to make zip of Google Drive folder\n\n"
-            gmsg += f"Use /{BotCommands.UnzipMirrorCommand[0]} to extracts Google Drive archive folder/file"
-            sendMessage(gmsg, bot, message)
-        else:
-            Thread(target=add_gd_download, args=(link, f'{DOWNLOAD_DIR}{listener.uid}', listener, name)).start()
-    elif is_mega_link(link):
-        Thread(target=add_mega_download, args=(link, f'{DOWNLOAD_DIR}{listener.uid}/', listener, name)).start()
-    elif isQbit and (is_magnet(link) or ospath.exists(link)):
-        Thread(target=QbDownloader(listener).add_qb_torrent, args=(link, f'{DOWNLOAD_DIR}{listener.uid}',
-                                                                   select, ratio, seed_time)).start()
-    else:
-        if len(mesg) > 1:
-            ussr = mesg[1]
-            if len(mesg) > 2:
-                pssw = mesg[2]
+        if isinstance(reply_to, list):
+            self.bulk = reply_to
+            b_msg = input_list[:1]
+            self.options = " ".join(input_list[1:])
+            b_msg.append(f"{self.bulk[0]} -i {len(self.bulk)} {self.options}")
+            nextmsg = await send_message(self.message, " ".join(b_msg))
+            nextmsg = await self.client.get_messages(
+                chat_id=self.message.chat.id, message_ids=nextmsg.id
+            )
+            if self.message.from_user:
+                nextmsg.from_user = self.user
             else:
-                pssw = ''
-            auth = f"{ussr}:{pssw}"
-            auth = "Basic " + b64encode(auth.encode()).decode('ascii')
+                nextmsg.sender_chat = self.user
+            await Mirror(
+                self.client,
+                nextmsg,
+                self.is_qbit,
+                self.is_leech,
+                self.is_jd,
+                self.is_nzb,
+                self.same_dir,
+                self.bulk,
+                self.multi_tag,
+                self.options,
+            ).new_event()
+            return
+
+        if reply_to:
+            file_ = (
+                reply_to.document
+                or reply_to.photo
+                or reply_to.video
+                or reply_to.audio
+                or reply_to.voice
+                or reply_to.video_note
+                or reply_to.sticker
+                or reply_to.animation
+                or None
+            )
+
+            if file_ is None:
+                if reply_text := reply_to.text:
+                    self.link = reply_text.split("\n", 1)[0].strip()
+                else:
+                    reply_to = None
+            elif reply_to.document and (
+                file_.mime_type == "application/x-bittorrent"
+                or file_.file_name.endswith((".torrent", ".dlc", ".nzb"))
+            ):
+                self.link = await reply_to.download()
+                file_ = None
+
+        if (
+            not self.link
+            and file_ is None
+            or is_telegram_link(self.link)
+            and reply_to is None
+            or file_ is None
+            and not is_url(self.link)
+            and not is_magnet(self.link)
+            and not await aiopath.exists(self.link)
+            and not is_rclone_path(self.link)
+            and not is_gdrive_id(self.link)
+            and not is_gdrive_link(self.link)
+        ):
+            await send_message(
+                self.message, COMMAND_USAGE["mirror"][0], COMMAND_USAGE["mirror"][1]
+            )
+            await self.remove_from_same_dir()
+            return
+
+        if len(self.link) > 0:
+            LOGGER.info(self.link)
+
+        try:
+            await self.before_start()
+        except Exception as e:
+            await send_message(self.message, e)
+            await self.remove_from_same_dir()
+            return
+
+        if (
+            not self.is_jd
+            and not self.is_nzb
+            and not self.is_qbit
+            and not is_magnet(self.link)
+            and not is_rclone_path(self.link)
+            and not is_gdrive_link(self.link)
+            and not self.link.endswith(".torrent")
+            and file_ is None
+            and not is_gdrive_id(self.link)
+        ):
+            content_type = await get_content_type(self.link)
+            if content_type is None or re_match(r"text/html|text/plain", content_type):
+                try:
+                    self.link = await sync_to_async(direct_link_generator, self.link)
+                    if isinstance(self.link, tuple):
+                        self.link, headers = self.link
+                    elif isinstance(self.link, str):
+                        LOGGER.info(f"Generated link: {self.link}")
+                except DirectDownloadLinkException as e:
+                    e = str(e)
+                    if "This link requires a password!" not in e:
+                        LOGGER.info(e)
+                    if e.startswith("ERROR:"):
+                        await send_message(self.message, e)
+                        await self.remove_from_same_dir()
+                        return
+                except Exception as e:
+                    await send_message(self.message, e)
+                    await self.remove_from_same_dir()
+                    return
+
+        if file_ is not None:
+            await TelegramDownloadHelper(self).add_download(
+                reply_to, f"{path}/", session
+            )
+        elif isinstance(self.link, dict):
+            await add_direct_download(self, path)
+        elif self.is_jd:
+            await add_jd_download(self, path)
+        elif self.is_qbit:
+            await add_qb_torrent(self, path, ratio, seed_time)
+        elif self.is_nzb:
+            await add_nzb(self, path)
+        elif is_rclone_path(self.link):
+            await add_rclone_download(self, f"{path}/")
+        elif is_gdrive_link(self.link) or is_gdrive_id(self.link):
+            await add_gd_download(self, path)
         else:
-            auth = ''
-        Thread(target=add_aria2c_download, args=(link, f'{DOWNLOAD_DIR}{listener.uid}', listener, name,
-                                                 auth, select, ratio, seed_time)).start()
-
-    if multi > 1:
-        sleep(4)
-        nextmsg = type('nextmsg', (object, ), {'chat_id': message.chat_id, 'message_id': message.reply_to_message.message_id + 1})
-        msg = message.text.split(maxsplit=mi+1)
-        msg[mi] = f"{multi - 1}"
-        nextmsg = sendMessage(" ".join(msg), bot, nextmsg)
-        nextmsg.from_user.id = message.from_user.id
-        sleep(4)
-        Thread(target=_mirror_leech, args=(bot, nextmsg, isZip, extract, isQbit, isLeech)).start()
+            ussr = args["-au"]
+            pssw = args["-ap"]
+            if ussr or pssw:
+                auth = f"{ussr}:{pssw}"
+                headers += (
+                    f" authorization: Basic {b64encode(auth.encode()).decode('ascii')}"
+                )
+            await add_aria2_download(self, path, headers, ratio, seed_time)
 
 
-def mirror(update, context):
-    _mirror_leech(context.bot, update.message)
+async def mirror(client, message):
+    bot_loop.create_task(Mirror(client, message).new_event())
 
-def unzip_mirror(update, context):
-    _mirror_leech(context.bot, update.message, extract=True)
 
-def zip_mirror(update, context):
-    _mirror_leech(context.bot, update.message, True)
+async def qb_mirror(client, message):
+    bot_loop.create_task(Mirror(client, message, is_qbit=True).new_event())
 
-def qb_mirror(update, context):
-    _mirror_leech(context.bot, update.message, isQbit=True)
 
-def qb_unzip_mirror(update, context):
-    _mirror_leech(context.bot, update.message, extract=True, isQbit=True)
+async def jd_mirror(client, message):
+    bot_loop.create_task(Mirror(client, message, is_jd=True).new_event())
 
-def qb_zip_mirror(update, context):
-    _mirror_leech(context.bot, update.message, True, isQbit=True)
 
-def leech(update, context):
-    _mirror_leech(context.bot, update.message, isLeech=True)
+async def nzb_mirror(client, message):
+    bot_loop.create_task(Mirror(client, message, is_nzb=True).new_event())
 
-def unzip_leech(update, context):
-    _mirror_leech(context.bot, update.message, extract=True, isLeech=True)
 
-def zip_leech(update, context):
-    _mirror_leech(context.bot, update.message, True, isLeech=True)
+async def leech(client, message):
+    bot_loop.create_task(Mirror(client, message, is_leech=True).new_event())
 
-def qb_leech(update, context):
-    _mirror_leech(context.bot, update.message, isQbit=True, isLeech=True)
 
-def qb_unzip_leech(update, context):
-    _mirror_leech(context.bot, update.message, extract=True, isQbit=True, isLeech=True)
+async def qb_leech(client, message):
+    bot_loop.create_task(
+        Mirror(client, message, is_qbit=True, is_leech=True).new_event()
+    )
 
-def qb_zip_leech(update, context):
-    _mirror_leech(context.bot, update.message, True, isQbit=True, isLeech=True)
 
-mirror_handler = CommandHandler(BotCommands.MirrorCommand, mirror,
-                                filters=CustomFilters.authorized_chat | CustomFilters.authorized_user, run_async=True)
-unzip_mirror_handler = CommandHandler(BotCommands.UnzipMirrorCommand, unzip_mirror,
-                                filters=CustomFilters.authorized_chat | CustomFilters.authorized_user, run_async=True)
-zip_mirror_handler = CommandHandler(BotCommands.ZipMirrorCommand, zip_mirror,
-                                filters=CustomFilters.authorized_chat | CustomFilters.authorized_user, run_async=True)
-qb_mirror_handler = CommandHandler(BotCommands.QbMirrorCommand, qb_mirror,
-                                filters=CustomFilters.authorized_chat | CustomFilters.authorized_user, run_async=True)
-qb_unzip_mirror_handler = CommandHandler(BotCommands.QbUnzipMirrorCommand, qb_unzip_mirror,
-                                filters=CustomFilters.authorized_chat | CustomFilters.authorized_user, run_async=True)
-qb_zip_mirror_handler = CommandHandler(BotCommands.QbZipMirrorCommand, qb_zip_mirror,
-                                filters=CustomFilters.authorized_chat | CustomFilters.authorized_user, run_async=True)
-leech_handler = CommandHandler(BotCommands.LeechCommand, leech,
-                                filters=CustomFilters.authorized_chat | CustomFilters.authorized_user, run_async=True)
-unzip_leech_handler = CommandHandler(BotCommands.UnzipLeechCommand, unzip_leech,
-                                filters=CustomFilters.authorized_chat | CustomFilters.authorized_user, run_async=True)
-zip_leech_handler = CommandHandler(BotCommands.ZipLeechCommand, zip_leech,
-                                filters=CustomFilters.authorized_chat | CustomFilters.authorized_user, run_async=True)
-qb_leech_handler = CommandHandler(BotCommands.QbLeechCommand, qb_leech,
-                                filters=CustomFilters.authorized_chat | CustomFilters.authorized_user, run_async=True)
-qb_unzip_leech_handler = CommandHandler(BotCommands.QbUnzipLeechCommand, qb_unzip_leech,
-                                filters=CustomFilters.authorized_chat | CustomFilters.authorized_user, run_async=True)
-qb_zip_leech_handler = CommandHandler(BotCommands.QbZipLeechCommand, qb_zip_leech,
-                                filters=CustomFilters.authorized_chat | CustomFilters.authorized_user, run_async=True)
+async def jd_leech(client, message):
+    bot_loop.create_task(Mirror(client, message, is_leech=True, is_jd=True).new_event())
 
-dispatcher.add_handler(mirror_handler)
-dispatcher.add_handler(unzip_mirror_handler)
-dispatcher.add_handler(zip_mirror_handler)
-dispatcher.add_handler(qb_mirror_handler)
-dispatcher.add_handler(qb_unzip_mirror_handler)
-dispatcher.add_handler(qb_zip_mirror_handler)
-dispatcher.add_handler(leech_handler)
-dispatcher.add_handler(unzip_leech_handler)
-dispatcher.add_handler(zip_leech_handler)
-dispatcher.add_handler(qb_leech_handler)
-dispatcher.add_handler(qb_unzip_leech_handler)
-dispatcher.add_handler(qb_zip_leech_handler)
+
+async def nzb_leech(client, message):
+    bot_loop.create_task(
+        Mirror(client, message, is_leech=True, is_nzb=True).new_event()
+    )

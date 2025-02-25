@@ -1,96 +1,304 @@
-from random import SystemRandom
-from string import ascii_letters, digits
-from telegram.ext import CommandHandler
-from threading import Thread
-from time import sleep
+from asyncio import gather
+from json import loads
+from secrets import token_urlsafe
+from aiofiles.os import remove
 
-from bot.helper.mirror_utils.upload_utils.gdriveTools import GoogleDriveHelper
-from bot.helper.telegram_helper.message_utils import sendMessage, deleteMessage, delete_all_messages, update_all_messages, sendStatusMessage, sendFile, sendMarkup
-from bot.helper.telegram_helper.filters import CustomFilters
-from bot.helper.telegram_helper.bot_commands import BotCommands
-from bot.helper.mirror_utils.status_utils.clone_status import CloneStatus
-from bot import dispatcher, LOGGER, STOP_DUPLICATE, download_dict, download_dict_lock, Interval
-from bot.helper.ext_utils.bot_utils import is_gdrive_link, new_thread
+from .. import LOGGER, task_dict, task_dict_lock, bot_loop
+from ..helper.ext_utils.bot_utils import (
+    sync_to_async,
+    cmd_exec,
+    arg_parser,
+    COMMAND_USAGE,
+)
+from ..helper.ext_utils.exceptions import DirectDownloadLinkException
+from ..helper.ext_utils.links_utils import (
+    is_gdrive_link,
+    is_share_link,
+    is_rclone_path,
+    is_gdrive_id,
+)
+from ..helper.ext_utils.task_manager import stop_duplicate_check
+from ..helper.listeners.task_listener import TaskListener
+from ..helper.mirror_leech_utils.download_utils.direct_link_generator import (
+    direct_link_generator,
+)
+from ..helper.mirror_leech_utils.gdrive_utils.clone import GoogleDriveClone
+from ..helper.mirror_leech_utils.gdrive_utils.count import GoogleDriveCount
+from ..helper.mirror_leech_utils.rclone_utils.transfer import RcloneTransferHelper
+from ..helper.mirror_leech_utils.status_utils.gdrive_status import GoogleDriveStatus
+from ..helper.mirror_leech_utils.status_utils.rclone_status import RcloneStatus
+from ..helper.telegram_helper.message_utils import (
+    send_message,
+    delete_message,
+    send_status_message,
+)
 
 
-def _clone(message, bot):
-    args = message.text.split()
-    reply_to = message.reply_to_message
-    link = ''
-    multi = 0
-    if len(args) > 1:
-        link = args[1].strip()
-        if link.strip().isdigit():
-            multi = int(link)
-            link = ''
-        elif message.from_user.username:
-            tag = f"@{message.from_user.username}"
-        else:
-            tag = message.from_user.mention_html(message.from_user.first_name)
-    if reply_to:
-        if len(link) == 0:
-            link = reply_to.text.split(maxsplit=1)[0].strip()
-        if reply_to.from_user.username:
-            tag = f"@{reply_to.from_user.username}"
-        else:
-            tag = reply_to.from_user.mention_html(reply_to.from_user.first_name)
-    if is_gdrive_link(link):
-        gd = GoogleDriveHelper()
-        res, size, name, files = gd.helper(link)
-        if res != "":
-            return sendMessage(res, bot, message)
-        if STOP_DUPLICATE:
-            LOGGER.info('Checking File/Folder if already in Drive...')
-            cap, f_name = gd.drive_list(name, True, True)
-            if cap:
-                cap = f"File/Folder is already available in Drive. Here are the search results:\n\n{cap}"
-                sendFile(bot, message, f_name, cap)
-                return
-        if multi > 1:
-            sleep(4)
-            nextmsg = type('nextmsg', (object, ), {'chat_id': message.chat_id, 'message_id': message.reply_to_message.message_id + 1})
-            cmsg = message.text.split()
-            cmsg[1] = f"{multi - 1}"
-            nextmsg = sendMessage(" ".join(cmsg), bot, nextmsg)
-            nextmsg.from_user.id = message.from_user.id
-            sleep(4)
-            Thread(target=_clone, args=(nextmsg, bot)).start()
-        if files <= 20:
-            msg = sendMessage(f"Cloning: <code>{link}</code>", bot, message)
-            result, button = gd.clone(link)
-            deleteMessage(bot, msg)
-        else:
-            drive = GoogleDriveHelper(name)
-            gid = ''.join(SystemRandom().choices(ascii_letters + digits, k=12))
-            clone_status = CloneStatus(drive, size, message, gid)
-            with download_dict_lock:
-                download_dict[message.message_id] = clone_status
-            sendStatusMessage(message, bot)
-            result, button = drive.clone(link)
-            with download_dict_lock:
-                del download_dict[message.message_id]
-                count = len(download_dict)
+class Clone(TaskListener):
+    def __init__(
+        self,
+        client,
+        message,
+        _=None,
+        __=None,
+        ___=None,
+        ____=None,
+        _____=None,
+        bulk=None,
+        multi_tag=None,
+        options="",
+    ):
+        if bulk is None:
+            bulk = []
+        self.message = message
+        self.client = client
+        self.multi_tag = multi_tag
+        self.options = options
+        self.same_dir = {}
+        self.bulk = bulk
+        super().__init__()
+        self.is_clone = True
+
+    async def new_event(self):
+        text = self.message.text.split("\n")
+        input_list = text[0].split(" ")
+
+        args = {
+            "link": "",
+            "-i": 0,
+            "-b": False,
+            "-n": "",
+            "-up": "",
+            "-rcf": "",
+            "-sync": False,
+        }
+
+        arg_parser(input_list[1:], args)
+
+        try:
+            self.multi = int(args["-i"])
+        except:
+            self.multi = 0
+
+        self.up_dest = args["-up"]
+        self.rc_flags = args["-rcf"]
+        self.link = args["link"]
+        self.name = args["-n"]
+
+        is_bulk = args["-b"]
+        sync = args["-sync"]
+        bulk_start = 0
+        bulk_end = 0
+
+        if not isinstance(is_bulk, bool):
+            dargs = is_bulk.split(":")
+            bulk_start = dargs[0] or 0
+            if len(dargs) == 2:
+                bulk_end = dargs[1] or 0
+            is_bulk = True
+
+        if is_bulk:
+            await self.init_bulk(input_list, bulk_start, bulk_end, Clone)
+            return
+
+        await self.get_tag(text)
+
+        if not self.link and (reply_to := self.message.reply_to_message):
+            self.link = reply_to.text.split("\n", 1)[0].strip()
+
+        await self.run_multi(input_list, Clone)
+
+        if len(self.link) == 0:
+            await send_message(
+                self.message, COMMAND_USAGE["clone"][0], COMMAND_USAGE["clone"][1]
+            )
+            return
+        LOGGER.info(self.link)
+        try:
+            await self.before_start()
+        except Exception as e:
+            await send_message(self.message, e)
+            return
+        await self._proceed_to_clone(sync)
+
+    async def _proceed_to_clone(self, sync):
+        if is_share_link(self.link):
             try:
-                if count == 0:
-                    Interval[0].cancel()
-                    del Interval[0]
-                    delete_all_messages()
+                self.link = await sync_to_async(direct_link_generator, self.link)
+                LOGGER.info(f"Generated link: {self.link}")
+            except DirectDownloadLinkException as e:
+                LOGGER.error(str(e))
+                if str(e).startswith("ERROR:"):
+                    await send_message(self.message, str(e))
+                    return
+        if is_gdrive_link(self.link) or is_gdrive_id(self.link):
+            self.name, mime_type, self.size, files, _ = await sync_to_async(
+                GoogleDriveCount().count, self.link, self.user_id
+            )
+            if mime_type is None:
+                await send_message(self.message, self.name)
+                return
+            msg, button = await stop_duplicate_check(self)
+            if msg:
+                await send_message(self.message, msg, button)
+                return
+            await self.on_download_start()
+            LOGGER.info(f"Clone Started: Name: {self.name} - Source: {self.link}")
+            drive = GoogleDriveClone(self)
+            if files <= 10:
+                msg = await send_message(
+                    self.message, f"Cloning: <code>{self.link}</code>"
+                )
+            else:
+                msg = ""
+                gid = token_urlsafe(12)
+                async with task_dict_lock:
+                    task_dict[self.mid] = GoogleDriveStatus(self, drive, gid, "cl")
+                if self.multi <= 1:
+                    await send_status_message(self.message)
+            flink, mime_type, files, folders, dir_id = await sync_to_async(drive.clone)
+            if msg:
+                await delete_message(msg)
+            if not flink:
+                return
+            await self.on_upload_complete(
+                flink, files, folders, mime_type, dir_id=dir_id
+            )
+            LOGGER.info(f"Cloning Done: {self.name}")
+        elif is_rclone_path(self.link):
+            if self.link.startswith("mrcc:"):
+                self.link = self.link.replace("mrcc:", "", 1)
+                self.up_dest = self.up_dest.replace("mrcc:", "", 1)
+                config_path = f"rclone/{self.user_id}.conf"
+            else:
+                config_path = "rclone.conf"
+
+            remote, src_path = self.link.split(":", 1)
+            self.link = src_path.strip("/")
+            if self.link.startswith("rclone_select"):
+                mime_type = "Folder"
+                src_path = ""
+                if not self.name:
+                    self.name = self.link
+            else:
+                src_path = self.link
+                cmd = [
+                    "rclone",
+                    "lsjson",
+                    "--fast-list",
+                    "--stat",
+                    "--no-modtime",
+                    "--config",
+                    config_path,
+                    f"{remote}:{src_path}",
+                    "-v",
+                    "--log-systemd",
+                ]
+                res = await cmd_exec(cmd)
+                if res[2] != 0:
+                    if res[2] != -9:
+                        msg = f"Error: While getting rclone stat. Path: {remote}:{src_path}. Stderr: {res[1][:4000]}"
+                        await send_message(self.message, msg)
+                    return
+                rstat = loads(res[0])
+                if rstat["IsDir"]:
+                    if not self.name:
+                        self.name = src_path.rsplit("/", 1)[-1] if src_path else remote
+                    self.up_dest += (
+                        self.name if self.up_dest.endswith(":") else f"/{self.name}"
+                    )
+                    mime_type = "Folder"
                 else:
-                    update_all_messages()
-            except IndexError:
-                pass
-        cc = f'\n\n<b>cc: </b>{tag}'
-        if button in ["cancelled", ""]:
-            sendMessage(f"{tag} {result}", bot, message)
+                    if not self.name:
+                        self.name = src_path.rsplit("/", 1)[-1]
+                    mime_type = rstat["MimeType"]
+
+            await self.on_download_start()
+
+            RCTransfer = RcloneTransferHelper(self)
+            LOGGER.info(
+                f"Clone Started: Name: {self.name} - Source: {self.link} - Destination: {self.up_dest}"
+            )
+            gid = token_urlsafe(12)
+            async with task_dict_lock:
+                task_dict[self.mid] = RcloneStatus(self, RCTransfer, gid, "cl")
+            if self.multi <= 1:
+                await send_status_message(self.message)
+            method = "sync" if sync else "copy"
+            flink, destination = await RCTransfer.clone(
+                config_path,
+                remote,
+                src_path,
+                mime_type,
+                method,
+            )
+            if self.link.startswith("rclone_select"):
+                await remove(self.link)
+            if not destination:
+                return
+            LOGGER.info(f"Cloning Done: {self.name}")
+            cmd1 = [
+                "rclone",
+                "lsf",
+                "--fast-list",
+                "-R",
+                "--files-only",
+                "--config",
+                config_path,
+                destination,
+                "-v",
+                "--log-systemd",
+            ]
+            cmd2 = [
+                "rclone",
+                "lsf",
+                "--fast-list",
+                "-R",
+                "--dirs-only",
+                "--config",
+                config_path,
+                destination,
+                "-v",
+                "--log-systemd",
+            ]
+            cmd3 = [
+                "rclone",
+                "size",
+                "--fast-list",
+                "--json",
+                "--config",
+                config_path,
+                destination,
+                "-v",
+                "--log-systemd",
+            ]
+            res1, res2, res3 = await gather(
+                cmd_exec(cmd1),
+                cmd_exec(cmd2),
+                cmd_exec(cmd3),
+            )
+            if res1[2] != 0 or res2[2] != 0 or res3[2] != 0:
+                if res1[2] == -9:
+                    return
+                files = None
+                folders = None
+                self.size = 0
+                error = res1[1] or res2[1] or res3[1]
+                msg = f"Error: While getting rclone stat. Path: {destination}. Stderr: {error[:4000]}"
+                await self.on_upload_error(msg)
+            else:
+                files = len(res1[0].split("\n"))
+                folders = len(res2[0].strip().split("\n")) if res2[0] else 0
+                rsize = loads(res3[0])
+                self.size = rsize["bytes"]
+                await self.on_upload_complete(
+                    flink, files, folders, mime_type, destination
+                )
         else:
-            sendMarkup(result + cc, bot, message, button)
-            LOGGER.info(f'Cloning Done: {name}')
-    else:
-        sendMessage("Send Gdrive link along with command or by replying to the link by command\n\n<b>Multi links only by replying to first link/file:</b>\n<code>/cmd</code> 10(number of links/files)", bot, message)
+            await send_message(
+                self.message, COMMAND_USAGE["clone"][0], COMMAND_USAGE["clone"][1]
+            )
 
-@new_thread
-def cloneNode(update, context):
-    _clone(update.message, context.bot)
 
-clone_handler = CommandHandler(BotCommands.CloneCommand, cloneNode, filters=CustomFilters.authorized_chat | CustomFilters.authorized_user, run_async=True)
-dispatcher.add_handler(clone_handler)
+async def clone_node(client, message):
+    bot_loop.create_task(Clone(client, message).new_event())
